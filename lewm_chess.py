@@ -1,32 +1,23 @@
-# ============================================================
-# LeWorldModel Chess Engine — Final A100 Implementation
-# ============================================================
-# Based on: "LeWorldModel: Stable End-to-End JEPA from Pixels"
-# Paper:   https://arxiv.org/pdf/2603.19312
-# Code:    https://github.com/lucas-maes/le-wm
-#
-# Architecture from the paper (§3.1, Appendix D):
-#   - Encoder: ViT-Tiny (patch=14, 12 layers, 3 heads, dim=192)
-#   - Projector: 1-layer MLP + BatchNorm (removes LayerNorm effect)
-#   - Predictor: 6-layer Transformer, 16 heads, AdaLN-zero conditioning
-#   - Loss: ℒ_pred (MSE, teacher-forced) + λ·SIGReg (Gaussian prior)
-#
-# Chess adaptations:
-#   - Board rendered as 128×128 RGB with piece-type-specific colors
-#     → patch_size=16 gives exactly 64 tokens (1 per square)
-#   - Discrete move embedder replaces continuous action Conv1d
-#   - CEM planner adapted for legal-move-constrained discrete search
-#   - Optional policy head for fast move prediction
-#
-# Hardware target: NVIDIA A100 (40/80 GB)
-# ============================================================
+"""
+LeWM Chess Engine
+
+A chess world model based on the LeWorldModel JEPA architecture.
+Paper: https://arxiv.org/abs/2603.19312
+Original code: https://github.com/lucas-maes/le-wm
+
+Architecture:
+    Encoder:   ViT-Tiny (patch=16, 128x128 input, 64 tokens = 1 per square)
+    Projector: MLP + BatchNorm (192 -> 2048 -> 192)
+    Predictor: 6-layer AdaLN-zero Transformer, 16 heads
+    Loss:      MSE prediction + SIGReg regularization (lambda=0.09)
+
+Chess extensions:
+    Discrete move embedder, game-progress conditioning, value head,
+    CEM planner for discrete search, policy head for fast inference.
+"""
 
 
-# %% ── CELL 1: Install dependencies ──────────────────────────
-# !pip install python-chess timm einops pillow tqdm -q
 
-
-# %% ── CELL 2: Imports & config ──────────────────────────────
 
 import chess
 import chess.pgn
@@ -50,12 +41,10 @@ from einops import rearrange
 from tqdm import tqdm
 import timm
 
-# ── A100 optimizations ──
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-# ── Reproducibility ──
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -72,78 +61,67 @@ if DEVICE == "cuda":
 
 @dataclass
 class Config:
-    """
-    Hyperparameters aligned with the paper (Appendix D + G ablations).
-    Tuned for A100 with chess-specific adaptations.
-    """
-    # ── File paths ──
+    """Training and model hyperparameters."""
     pgn_path: str = "gukesh.pgn"
-    cache_path: str = "dataset_game_v2.pt"  # Full-game trajectory cache
+    cache_path: str = "dataset_game_v2.pt"
 
-    # ── Data ──
     img_size: int = 128
     patch_size: int = 16
-    frame_skip: int = 2           # Every full move
-    seq_len: int = 20             # 20-frame windows from full games
-    history_size: int = 16        # 16 positions of context (~16 full moves)
-    num_preds: int = 4            # Predict 4 steps ahead (strategic)
+    frame_skip: int = 2
+    seq_len: int = 20
+    history_size: int = 16
+    num_preds: int = 4
     val_split: float = 0.1
 
-    # ── Model (ViT-Tiny, paper §3.1) ──
-    embed_dim: int = 192          # Paper: 192 (ablation: ≥184 needed)
-    hidden_dim: int = 192         # ViT-Tiny hidden dim
+    embed_dim: int = 192
+    hidden_dim: int = 192
 
-    # ── Move vocabulary ──
-    n_move_vocab: int = 4352      # 64×64 from-to + 256 promotion slots
-    move_embed_dim: int = 64      # Intermediate move embedding
+    n_move_vocab: int = 4352
+    move_embed_dim: int = 64
 
-    # ── Predictor (paper: ViT-S backbone, 6 layers, 16 heads) ──
-    pred_depth: int = 6           # Paper: 6 (ablation: ViT-S optimal)
-    pred_heads: int = 16          # Paper: 16
-    pred_mlp_dim: int = 2048      # Paper: 2048 (4× hidden)
+    pred_depth: int = 6
+    pred_heads: int = 16
+    pred_mlp_dim: int = 2048
     pred_dim_head: int = 64
-    pred_dropout: float = 0.1     # Paper: 0.1 (ablation: critical)
+    pred_dropout: float = 0.1
     pred_emb_dropout: float = 0.0
 
-    # ── SIGReg (paper §3.1, Appendix A & G) ──
-    # Paper ablation (Fig 16): λ∈[0.01, 0.2] all achieve >80% success.
-    # We use 0.09 (paper default) with warmup to handle high initial values.
-    sigreg_knots: int = 17        # Integration nodes  (repo: 17)
-    sigreg_num_proj: int = 1024   # Random projections (repo: 1024)
-    sigreg_lambda: float = 0.09   # λ (paper: 0.09)
-    sigreg_warmup_epochs: int = 0 # 0 = fixed λ from epoch 0 (paper default, CRITICAL)
+    sigreg_knots: int = 17
+    sigreg_num_proj: int = 1024
+    sigreg_lambda: float = 0.09
+    sigreg_warmup_epochs: int = 0
 
-    # ── Training ──
-    batch_size: int = 128         # Reduced: seq_len=20 → 5x more ViT calls per batch
+    batch_size: int = 128
     lr: float = 1e-4
     weight_decay: float = 1e-3
-    epochs: int = 40              # More epochs to compensate smaller batch
+    epochs: int = 40
     warmup_epochs: int = 3
     grad_clip: float = 5.0
     precision: str = "bf16"
     log_every: int = 50
     compile_model: bool = True
 
-    # ── Auxiliary heads ──
     use_policy_head: bool = True
     policy_loss_weight: float = 0.1
-    use_value_head: bool = True   # NEW: predict game outcome from embedding
+    use_value_head: bool = True
     value_loss_weight: float = 0.05
-    use_game_progress: bool = True  # NEW: condition on move progress (0=opening, 1=endgame)
+    use_game_progress: bool = True
 
-    # ── Planning (CEM, paper Appendix B & D) ──
-    cem_samples: int = 300        # Paper: 300
-    cem_iters: int = 30           # Paper: 30
-    cem_elites: int = 30          # Paper: 30
-    plan_horizon: int = 5         # Paper: 5
+    cem_samples: int = 300
+    cem_iters: int = 30
+    cem_elites: int = 30
+    plan_horizon: int = 5
 
 
 CFG = Config()
 print(f"Config: img={CFG.img_size}, embed={CFG.embed_dim}, "
-      f"batch={CFG.batch_size}, epochs={CFG.epochs}, λ={CFG.sigreg_lambda}")
+      f"batch={CFG.batch_size}, epochs={CFG.epochs}, lambda={CFG.sigreg_lambda}")
 
 
-# %% ── CELL 3: Move vocabulary ──────────────────────────
+
+# ---------------------------------------------------------------------------
+# Move vocabulary
+# ---------------------------------------------------------------------------
 
 _PROMO_PIECES = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
 
@@ -163,16 +141,10 @@ def idx_to_move(idx: int, board: chess.Board) -> Optional[chess.Move]:
     return None
 
 
-# %% ── CELL 4: Board renderer (enhanced for JEPA) ──────────
-#
-# WHY PIECE-SPECIFIC COLORS?
-# The ViT must learn to distinguish 12 piece types (6 types × 2 colors)
-# from raw pixels. With our prior circle-only renderer, pieces differed
-# only by radius (1-pixel differences at 64×64). The ViT struggled.
-#
-# Using unique hue per piece type + brightness for white/black gives
-# 12 visually distinct categories that the ViT can trivially separate.
-# This is the single biggest improvement for chess-from-pixels.
+
+# ---------------------------------------------------------------------------
+# Board renderer: 12 piece-type-specific colors for ViT patch separation
+# ---------------------------------------------------------------------------
 
 _LIGHT_SQ = (240, 217, 181)
 _DARK_SQ = (181, 136, 99)
@@ -235,11 +207,10 @@ _demo = board_to_tensor(chess.Board(), CFG.img_size)
 print(f"Board tensor: {_demo.shape}, range [{_demo.min():.1f}, {_demo.max():.1f}]")
 
 
-# %% ── CELL 5: PGN parser & dataset (full-game trajectory) ───
-#
-# Stores FEN strings + move indices + game results + move progress.
-# Images rendered on-the-fly. Game results enable value head training.
-# Move progress enables game-phase conditioning.
+
+# ---------------------------------------------------------------------------
+# PGN parser and dataset
+# ---------------------------------------------------------------------------
 
 _RESULT_MAP = {"1-0": 0, "0-1": 1, "1/2-1/2": 2, "*": 2}
 
@@ -355,15 +326,11 @@ class GukeshDataset(Dataset):
 
 
 
-# %% ── CELL 6: SIGReg ───────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# SIGReg: matches embedding distribution to N(0,1) via Epps-Pulley statistic
 # Faithful port from module.py in the LeWM repo.
-#
-# Paper (Appendix A): SIGReg matches embedding distribution to N(0,1)
-# via random projections + Epps-Pulley test statistic.
-#
-# The repo code uses t∈[0,3] with Gaussian window weighting,
-# NOT the [0.2,4] mentioned in the Appendix A text (the code is
-# the ground truth implementation).
+# ---------------------------------------------------------------------------
 
 class SIGReg(nn.Module):
     def __init__(self, num_proj: int = 1024, knots: int = 17):
@@ -388,7 +355,10 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
-# %% ── CELL 7: Core modules (from module.py) ────────────────
+
+# ---------------------------------------------------------------------------
+# Core modules: Attention, FeedForward, Block, ConditionalBlock
+# ---------------------------------------------------------------------------
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation: x * (1 + scale) + shift"""
@@ -446,12 +416,7 @@ class Block(nn.Module):
 
 
 class ConditionalBlock(nn.Module):
-    """
-    AdaLN-zero: 6-way modulation (shift, scale, gate) × (attn, ffn).
-    The gate mechanism is what makes this stable — it starts at 0 (no
-    conditioning) and learns to gradually incorporate action information.
-    This is the paper's key architectural contribution for the predictor.
-    """
+    """AdaLN-zero block: 6-way modulation (shift, scale, gate) x (attn, ffn)."""
     def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
         super().__init__()
         self.attn = Attention(dim, heads, dim_head, dropout)
@@ -473,7 +438,10 @@ class ConditionalBlock(nn.Module):
         return x
 
 
-# %% ── CELL 8: Transformer, ARPredictor, MLP, Embedder ──────
+
+# ---------------------------------------------------------------------------
+# Transformer, ARPredictor, MLP, ChessMoveEmbedder
+# ---------------------------------------------------------------------------
 
 class Transformer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, depth,
@@ -535,10 +503,7 @@ class MLP(nn.Module):
 
 
 class ChessMoveEmbedder(nn.Module):
-    """
-    Replaces the paper's Conv1d Embedder (for continuous actions).
-    Optionally conditioned on move progress (0=opening, 1=endgame).
-    """
+    """Discrete move embedder, optionally conditioned on game progress."""
     def __init__(self, n_moves=4352, move_embed_dim=64, emb_dim=192,
                  mlp_scale=4, use_progress=False):
         super().__init__()
@@ -564,7 +529,10 @@ class ChessMoveEmbedder(nn.Module):
         return out
 
 
-# %% ── CELL 9: JEPA (from jepa.py) ──────────────────────────
+
+# ---------------------------------------------------------------------------
+# JEPA: Joint-Embedding Predictive Architecture
+# ---------------------------------------------------------------------------────
 
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
@@ -650,7 +618,10 @@ class JEPA(nn.Module):
         return self.criterion(info_dict)
 
 
-# %% ── CELL 10: Model builder ───────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Model builder, forward pass, and training loop
+# ---------------------------------------------------------------------------────
 
 class PolicyHead(nn.Module):
     def __init__(self, embed_dim, n_moves):
@@ -665,11 +636,7 @@ class PolicyHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """
-    Predicts game outcome from latent embedding.
-    3 classes: white_win (0), black_win (1), draw (2).
-    Forces the latent space to encode strategic information.
-    """
+    """Predicts game outcome (white win / black win / draw) from latent embedding."""
     def __init__(self, embed_dim):
         super().__init__()
         self.head = nn.Sequential(
@@ -724,10 +691,7 @@ def build_model(cfg: Config):
 
 
 def lejepa_forward(model, sigreg, policy_head, value_head, batch, cfg, epoch):
-    """
-    Full-game trajectory forward pass.
-    Now handles: value head, game-progress conditioning, multi-step prediction.
-    """
+    """Full forward pass: prediction loss + SIGReg + policy + value."""
     obs, moves, game_result, progress = batch
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
@@ -977,7 +941,10 @@ def train_lewm(cfg: Config):
 
 
 
-# %% ── CELL 12: CEM planner ─────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# CEM planner: Cross-Entropy Method for discrete move search
+# ---------------------------------------------------------------------------────
 
 class CEMPlanner:
     def __init__(self, model, cfg):
@@ -1058,7 +1025,10 @@ class CEMPlanner:
         return min(legal, key=lambda m: abs(move_to_idx(m) - best_idx))
 
 
-# %% ── CELL 13: Policy-based player (fast) ──────────────────
+
+# ---------------------------------------------------------------------------
+# Policy-based player: direct move selection (no search)
+# ---------------------------------------------------------------------------──
 
 class PolicyPlayer:
     """Direct move selection via policy head — no search needed."""
@@ -1107,7 +1077,10 @@ class PolicyPlayer:
         return random.choice(legal)
 
 
-# %% ── CELL 14: Load & play ─────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Load checkpoint and interactive play
+# ---------------------------------------------------------------------------────────
 
 def load_model(ckpt_path, cfg):
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
@@ -1176,7 +1149,10 @@ def play_vs_lewm(model, policy_head, cfg,
     print(f"\n{board}\nResult: {board.result()}")
 
 
-# %% ── CELL 15: Latent probing ───────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Latent space probing
+# ---------------------------------------------------------------------------──────
 
 PIECE_VALUES = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -1238,7 +1214,10 @@ def probe_latent_space(model, cfg, cache_path, n_samples=2000):
               f"  MLP={r2_score(yte, mlp.predict(Xte)):.3f}")
 
 
-# %% ── CELL 16: Training curves ─────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Training curve plots
+# ---------------------------------------------------------------------------─────
 
 def plot_training(history):
     """Plot training curves (call after training)."""
@@ -1277,11 +1256,10 @@ def plot_training(history):
     print("Saved: lewm_training_curves.png")
 
 
-# %% ── CELL 17: Showcase visualizations ─────────────────────
-#
-# Publication-quality visualizations demonstrating the model's
-# learned capabilities: value prediction, latent structure,
-# surprise detection, and strategic understanding.
+
+# ---------------------------------------------------------------------------
+# Showcase visualizations
+# ---------------------------------------------------------------------------
 
 def _get_raw(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1734,13 +1712,9 @@ def showcase_full_report(model, policy_head, value_head, cfg, cache_path):
 
 
 
-#
-# The paper (§5.2) shows that JEPA prediction error detects
-# "physically implausible events" — i.e., surprising states.
-# In chess, surprising positions = tactics, sacrifices, brilliant moves.
-#
-# We scan positions, compute ||z_predicted - z_actual||², and
-# rank by surprise. The top-K most surprising positions are puzzles.
+# ---------------------------------------------------------------------------
+# Puzzle generation via JEPA surprise detection (Violation of Expectation)
+# ---------------------------------------------------------------------------
 
 def _load_game_headers(pgn_path):
     """Read all game headers from PGN (fast — skips move parsing)."""
@@ -1770,10 +1744,7 @@ def _find_game_idx(pos_idx, boundaries):
 
 
 def generate_puzzles(model, cfg, cache_path, n_scan=10000, n_puzzles=20):
-    """
-    Find chess puzzles using JEPA surprise detection.
-    Now includes source game information (players, event, date).
-    """
+    """Find chess puzzles by ranking positions by JEPA prediction error."""
     data = torch.load(cache_path, weights_only=False)
     fens = data["fens"]
     moves = data["moves"]
@@ -1934,31 +1905,16 @@ def puzzles_to_lichess(puzzles):
 
 
 if __name__ == "__main__":
-
-    # Verify PGN
     n = 0
     with open(CFG.pgn_path, encoding="utf-8", errors="ignore") as f:
         while chess.pgn.read_game(f):
             n += 1
     print(f"PGN: {n} games in {CFG.pgn_path}")
 
-    # ── Uncomment below to run ──
+    # Step 1: cache_path = parse_and_cache(CFG.pgn_path, CFG)
+    # Step 2: model, sigreg, policy_head, value_head, history = train_lewm(CFG)
+    # Step 3: model, sigreg, policy_head, value_head = load_model("lewm_chess_best.pt", CFG)
+    # Step 4: probe_latent_space(model, CFG, CFG.cache_path)
+    # Step 5: play_vs_lewm(model, policy_head, CFG, use_policy=False)
 
-    # Step 1: Parse & cache (delete old cache first if changing img_size!)
-    # cache_path = parse_and_cache(CFG.pgn_path, CFG)
-
-    # Step 2: Train
-    # model, sigreg, policy_head, history = train_lewm(CFG)
-    # plot_training(history)
-
-    # Step 3: Load & evaluate
-    # model, sigreg, policy_head = load_model("lewm_chess_best.pt", CFG)
-
-    # Step 4: Probe latent space
-    # probe_latent_space(model, CFG, CFG.cache_path)
-
-    # Step 5: Play (policy mode = fast, CEM mode = stronger but slower)
-    # play_vs_lewm(model, policy_head, CFG, use_policy=True)
-    # play_vs_lewm(model, policy_head, CFG, use_policy=False)  # CEM mode
-
-    print("\nReady. Uncomment Steps 1-5 above to run.")
+    print("Ready. Uncomment steps above to run.")
