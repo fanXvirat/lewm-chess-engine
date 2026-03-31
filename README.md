@@ -19,7 +19,7 @@
 
 This project applies **[LeWorldModel](https://arxiv.org/abs/2603.19312)** (LeWM) — a stable end-to-end Joint-Embedding Predictive Architecture (JEPA) — to chess. Instead of the traditional approach of search + evaluation, we train a **world model** that learns the dynamics of chess from raw board images, then uses its learned latent representations for move prediction, game outcome estimation, and tactical puzzle generation.
 
-The engine is trained on **17,229 games by Gukesh D.**, the youngest World Chess Champion. It learns strategic patterns entirely from full-game trajectories — 20-move windows where the model sees 16 positions of context and predicts 4 steps ahead. This forces the model to internalize strategic dynamics: pawn structures, piece coordination, opening theory, and endgame technique.
+The engine is trained on **17,229 games from five elite GMs**: Gukesh D., Nodirbek Abdusattorov, Praggnanandhaa R., Ian Nepomniachtchi, and Anish Giri. It learns strategic patterns entirely from full-game trajectories — 20-move windows where the model sees 16 positions of context and predicts 4 steps ahead. This forces the model to internalize strategic dynamics: pawn structures, piece coordination, opening theory, and endgame technique.
 
 **Key result**: The CEM planner (which uses the learned world model to simulate future positions in latent space) plays *significantly better chess* than the policy head (which pattern-matches from a single position). This validates the world model approach — the JEPA predictor learned real chess dynamics, not just surface-level patterns.
 
@@ -105,7 +105,7 @@ Every core component maps directly to the LeWM paper. The chess-specific additio
 | Metric | Value |
 |:---|:---|
 | Hardware | NVIDIA A100-SXM4 (40GB VRAM) |
-| Dataset | 17,229 games (Gukesh D. PGN, 826,878 positions) |
+| Dataset | 17,229 games from 5 elite GMs (Gukesh, Abdusattorov, Praggnanandhaa, Nepomniachtchi, Giri), 826,878 positions |
 | Train split | 436,478 trajectories from 15,507 games |
 | Validation split | 45,820 trajectories from 1,722 games |
 | Training | 10 epochs, 3,409 steps/epoch (~19 min/epoch) |
@@ -227,16 +227,10 @@ Using the paper's "violation of expectation" framework (Section 5.2), we scan 15
 FEN: 8/p1K5/2P5/5bkp/8/8/5R2/8  w - - 1 54
 White to move: Rxf5+!  (Surprise score: 545.45)
 ```
-```
-. . . . . . . .
-p . K . . . . .
-. . P . . . . .
-. . . . . b k p
-. . . . . . . .
-. . . . . . . .
-. . . . . R . .
-. . . . . . . .
-```
+
+<p align="center">
+  <img src="assets/puzzle_rxf5.png" width="400">
+</p>
 
 This is a genuine tactical shot: White plays **Rxf5+**, sacrificing the rook for the bishop with check. After Kxf5, White's c-pawn is unstoppable (c6-c7-c8=Q). It is a textbook exchange sacrifice — the kind of move that separates strong players from weak ones.
 
@@ -419,7 +413,7 @@ lewm-chess-engine/
 ## Acknowledgements
 
 - **[LeWorldModel](https://github.com/lucas-maes/le-wm)** by Lucas Maes, Quentin Le Lidec, Damien Scieur, Yann LeCun, and Randall Balestriero — the original JEPA architecture and SIGReg regularizer
-- **[Gukesh D.](https://en.wikipedia.org/wiki/Gukesh_Dommaraju)** — the youngest World Chess Champion, whose 17,229 games form our training dataset
+- **Training dataset** — 17,229 games from five elite GMs: [Gukesh D.](https://en.wikipedia.org/wiki/Gukesh_Dommaraju), [Nodirbek Abdusattorov](https://en.wikipedia.org/wiki/Nodirbek_Abdusattorov), [Praggnanandhaa R.](https://en.wikipedia.org/wiki/R_Praggnanandhaa), [Ian Nepomniachtchi](https://en.wikipedia.org/wiki/Ian_Nepomniachtchi), and [Anish Giri](https://en.wikipedia.org/wiki/Anish_Giri)
 - Built with PyTorch, timm, python-chess, and einops
 
 ## Citation

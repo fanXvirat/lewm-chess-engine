@@ -282,7 +282,7 @@ def parse_and_cache(pgn_path: str, cfg: Config) -> str:
     return str(cache)
 
 
-class GukeshDataset(Dataset):
+class ChessDataset(Dataset):
     """Full-game trajectory dataset with on-the-fly rendering."""
     def __init__(self, cache_path: str, cfg: Config, split: str = "train"):
         data = torch.load(cache_path, weights_only=False)
@@ -774,8 +774,8 @@ def train_lewm(cfg: Config):
     # ── Data ──
     cache_path = parse_and_cache(cfg.pgn_path, cfg)
     print("\nBuilding datasets...")
-    train_ds = GukeshDataset(cache_path, cfg, split="train")
-    val_ds = GukeshDataset(cache_path, cfg, split="val")
+    train_ds = ChessDataset(cache_path, cfg, split="train")
+    val_ds = ChessDataset(cache_path, cfg, split="val")
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=8, pin_memory=True, drop_last=True,
@@ -1115,7 +1115,7 @@ def play_vs_lewm(model, policy_head, cfg,
     move_n = 0
 
     print(f"\n{'═'*50}")
-    print(f"  Playing vs {engine_name} (Gukesh-trained)")
+    print(f"  Playing vs {engine_name}")
     print(f"  UCI format: e2e4, g1f3, e7e8q")
     print(f"{'═'*50}")
 
