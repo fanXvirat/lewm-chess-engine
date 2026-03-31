@@ -1,0 +1,17 @@
+# Data
+*.pt
+*.pgn
+dataset_*.pt
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
